@@ -1,0 +1,8 @@
+.git
+.github
+.gitignore
+README.md
+*.md
+bin/
+dist/
+coverage.out
