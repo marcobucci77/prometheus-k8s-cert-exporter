@@ -1,0 +1,25 @@
+# IDE
+.vscode/
+.idea/
+
+# Python environment
+.venv/
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+kubeconfig
+kubeconfig.*
+
+# Build artifacts
+bin/
+dist/
+*.exe
+
+# OS
+.DS_Store
+Thumbs.db
