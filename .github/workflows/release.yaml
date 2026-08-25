@@ -1,0 +1,276 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  CORPORATE_MARKERS_REGEX: ${{ secrets.CORPORATE_MARKERS_REGEX }}
+
+jobs:
+  release:
+    name: Build, Security Scan and Release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+
+    steps:
+      # ----------------------------------------------------------
+      # Checkout
+      # ----------------------------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # ----------------------------------------------------------
+      # Repository hygiene
+      # ----------------------------------------------------------
+
+      - name: Check for sensitive certificate and secret files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking tracked files for sensitive file types..."
+
+          FORBIDDEN_FILES="$(
+            git ls-files | grep -Ei \
+            '(^|/)(\.env($|\.)|kubeconfig($|[._-])|.*\.(pem|key|p12|pfx|jks|keystore|crt|cer))$' \
+            || true
+          )"
+
+          if [ -n "${FORBIDDEN_FILES}" ]; then
+            echo "::error::Potential sensitive certificate, key, environment or kubeconfig file detected."
+            echo "${FORBIDDEN_FILES}"
+            exit 1
+          fi
+
+          echo "No forbidden sensitive files detected."
+
+      - name: Check for corporate identifiers
+        if: ${{ env.CORPORATE_MARKERS_REGEX != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking repository for corporate identifiers..."
+
+          if git grep -IqEi "${CORPORATE_MARKERS_REGEX}" -- .; then
+            echo "::error::Corporate identifier detected in tracked repository content."
+            echo "Run the same check locally to identify and remove the offending content."
+            exit 1
+          fi
+
+          echo "No corporate identifiers detected."
+
+      # ----------------------------------------------------------
+      # Trivy repository security scans
+      # ----------------------------------------------------------
+
+      - name: Trivy secret scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: secret
+          format: table
+          exit-code: "1"
+
+      - name: Trivy configuration scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: misconfig
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          skip-setup-trivy: true
+
+      # ----------------------------------------------------------
+      # Go validation
+      # ----------------------------------------------------------
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Download Go modules
+        run: go mod download
+
+      - name: Check Go formatting
+        shell: bash
+        run: |
+          FILES="$(gofmt -l .)"
+
+          if [ -n "${FILES}" ]; then
+            echo "::error::The following Go files are not formatted:"
+            echo "${FILES}"
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run Go tests
+        run: go test ./...
+
+      - name: Build Go binary
+        run: |
+          CGO_ENABLED=0 \
+          GOOS=linux \
+          GOARCH=amd64 \
+          go build \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o prometheus-k8s-cert-exporter \
+            ./cmd/exporter
+
+      # ----------------------------------------------------------
+      # Docker setup
+      # ----------------------------------------------------------
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ----------------------------------------------------------
+      # Build local image for security scan
+      # ----------------------------------------------------------
+
+      - name: Build container image for security scan
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: prometheus-k8s-cert-exporter:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ----------------------------------------------------------
+      # Trivy container vulnerability scan
+      # ----------------------------------------------------------
+
+      - name: Trivy container vulnerability scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: prometheus-k8s-cert-exporter:${{ github.sha }}
+          scanners: vuln
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: table
+          exit-code: "1"
+          skip-setup-trivy: true
+
+      # ----------------------------------------------------------
+      # Cosign
+      # ----------------------------------------------------------
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      # ----------------------------------------------------------
+      # GHCR
+      # ----------------------------------------------------------
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=prometheus-k8s-cert-exporter
+            org.opencontainers.image.description=Prometheus exporter for monitoring X.509 certificates stored in Kubernetes TLS Secrets
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.licenses=Apache-2.0
+
+      # ----------------------------------------------------------
+      # Final multi-architecture build and push
+      # ----------------------------------------------------------
+
+      - name: Build and push multi-architecture container image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          sbom: true
+          provenance: mode=max
+
+      # ----------------------------------------------------------
+      # Sign immutable image digest
+      # ----------------------------------------------------------
+
+      - name: Sign container image
+        shell: bash
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          echo "Signing ${IMAGE}@${DIGEST}"
+
+          cosign sign \
+            --yes \
+            "${IMAGE}@${DIGEST}"
+
+      - name: Verify container signature
+        shell: bash
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          cosign verify \
+            "${IMAGE}@${DIGEST}" \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/.github/workflows/release.yaml@refs/tags/v.*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
+
+            
+      # ----------------------------------------------------------
+      # GitHub Release
+      # ----------------------------------------------------------
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file RELEASE_NOTES.md
