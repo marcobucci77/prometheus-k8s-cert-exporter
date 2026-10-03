@@ -37,7 +37,7 @@ spec:
       containers:
         - name: exporter
 
-          image: ghcr.io/marcobucci77/prometheus-k8s-cert-exporter@sha256:<DIGEST>
+          image: ghcr.io/marcobucci77/prometheus-k8s-cert-exporter:sha256-63984652ecffdf22602bbfb98138d9df6c5e644f12a5af71582831dc8187b150
           imagePullPolicy: IfNotPresent
 
           ports:
