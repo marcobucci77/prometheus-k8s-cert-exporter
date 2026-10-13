@@ -8,7 +8,9 @@ metadata:
     app.kubernetes.io/component: exporter
 
 spec:
+  # A single replica is normally sufficient for a Prometheus exporter.
   replicas: 1
+
   revisionHistoryLimit: 3
 
   selector:
@@ -22,12 +24,19 @@ spec:
         app.kubernetes.io/component: exporter
 
     spec:
+      # Dedicated ServiceAccount used to access Kubernetes Secrets
+      # only in explicitly authorized namespaces.
       serviceAccountName: prometheus-k8s-cert-exporter
       enableServiceLinks: false
 
-      securityContext:
-        runAsNonRoot: true
+      # Avoid injecting environment variables for all Services
+      # present in the namespace.
+      enableServiceLinks: false
 
+      # Pod-level security settings.
+      securityContext:
+        # Prevent containers from running as root.
+        runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
 
@@ -36,28 +45,55 @@ spec:
 
       containers:
         - name: exporter
-
-          image: ghcr.io/marcobucci77/prometheus-k8s-cert-exporter:sha256-63984652ecffdf22602bbfb98138d9df6c5e644f12a5af71582831dc8187b150
+          image: ghcr.io/marcobucci77/prometheus-k8s-cert-exporter:v2.2.0
           imagePullPolicy: IfNotPresent
 
+          # Namespaces that the exporter is allowed to scan.
+          #
+          # The exporter will perform a separate namespaced Secret List
+          # operation for each namespace defined here.
+          #
+          # A matching Role and RoleBinding must exist in every namespace.
+          #
+          # Example:
+          #   ciccio
+          #   pippo
+          #   paperina
+          #   anka
+          #   flodhast
+          env:
+            - name: WATCH_NAMESPACES
+              value: "anka,flodhast,default"
+
           ports:
+            # Prometheus metrics endpoint.
             - name: metrics
               containerPort: 8080
               protocol: TCP
 
           securityContext:
+            # Prevent processes from acquiring additional privileges.
             allowPrivilegeEscalation: false
+
+            # Explicitly disable privileged container execution.
             privileged: false
+
+            # The exporter does not need to write to the container filesystem.
             readOnlyRootFilesystem: true
 
+            # Run using the non-root UID/GID used by the distroless image.
             runAsNonRoot: true
             runAsUser: 65532
             runAsGroup: 65532
 
+            # Drop every Linux capability.
+            # The exporter does not require any additional capability.
             capabilities:
               drop:
                 - ALL
 
+          # Readiness currently checks that the metrics TCP socket is accepting
+          # connections. This could later be replaced by an HTTP /readyz endpoint.
           readinessProbe:
             tcpSocket:
               port: metrics
@@ -66,6 +102,8 @@ spec:
             timeoutSeconds: 2
             failureThreshold: 3
 
+          # Liveness verifies that the exporter continues to listen on its
+          # metrics port. This could later be replaced by an HTTP /healthz endpoint.
           livenessProbe:
             tcpSocket:
               port: metrics
@@ -74,6 +112,8 @@ spec:
             timeoutSeconds: 2
             failureThreshold: 3
 
+          # Limit resource consumption in case of unexpected behaviour
+          # or a very large number of Secrets.
           resources:
             requests:
               cpu: 10m
@@ -82,4 +122,5 @@ spec:
               cpu: 200m
               memory: 128Mi
 
+      # Allow the exporter some time to terminate gracefully.
       terminationGracePeriodSeconds: 30

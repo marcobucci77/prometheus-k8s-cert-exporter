@@ -3,6 +3,8 @@ package main
 import (
 	"log"
 	"net/http"
+	"os"
+	"strings"
 
 	"github.com/marcobucci77/prometheus-k8s-cert-exporter/internal/collector"
 	"github.com/marcobucci77/prometheus-k8s-cert-exporter/internal/kubeclient"
@@ -19,7 +21,35 @@ func main() {
 
 	log.Printf("Kubernetes client configured using %s", configSource)
 
-	certificateCollector := collector.NewCertificateCollector(clientset)
+	rawNamespaces := os.Getenv("WATCH_NAMESPACES")
+
+	if rawNamespaces == "" {
+		log.Fatal("WATCH_NAMESPACES environment variable is required")
+	}
+
+	var namespaces []string
+
+	for _, namespace := range strings.Split(rawNamespaces, ",") {
+		namespace = strings.TrimSpace(namespace)
+
+		if namespace != "" {
+			namespaces = append(namespaces, namespace)
+		}
+	}
+
+	if len(namespaces) == 0 {
+		log.Fatal("WATCH_NAMESPACES does not contain any valid namespace")
+	}
+
+	log.Printf(
+		"Monitoring Kubernetes namespaces: %s",
+		strings.Join(namespaces, ", "),
+	)
+
+	certificateCollector := collector.NewCertificateCollector(
+		clientset,
+		namespaces,
+	)
 
 	prometheus.MustRegister(certificateCollector)
 

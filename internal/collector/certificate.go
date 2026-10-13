@@ -17,7 +17,8 @@ import (
 )
 
 type CertificateCollector struct {
-	client kubernetes.Interface
+	client     kubernetes.Interface
+	namespaces []string
 
 	certificatesTotal       *prometheus.Desc
 	certificateExpiry       *prometheus.Desc
@@ -26,14 +27,18 @@ type CertificateCollector struct {
 	certificateParseSuccess *prometheus.Desc
 	certificateValid        *prometheus.Desc
 	scrapeSuccess           *prometheus.Desc
+	namespaceScrapeSuccess  *prometheus.Desc
 }
 
 func NewCertificateCollector(
 	client kubernetes.Interface,
+	namespaces []string,
 ) *CertificateCollector {
 
 	return &CertificateCollector{
-		client: client,
+		client:     client,
+		namespaces: namespaces,
+
 		certificateValid: prometheus.NewDesc(
 			"k8s_cert_exporter_certificate_valid",
 			"Whether the Kubernetes TLS certificate is currently within its validity period.",
@@ -88,6 +93,13 @@ func NewCertificateCollector(
 			nil,
 			nil,
 		),
+
+		namespaceScrapeSuccess: prometheus.NewDesc(
+			"k8s_cert_exporter_namespace_scrape_success",
+			"Whether collecting Kubernetes Secrets from a namespace succeeded.",
+			[]string{"namespace"},
+			nil,
+		),
 	}
 }
 
@@ -99,146 +111,163 @@ func (c *CertificateCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.certificateParseSuccess
 	ch <- c.certificateValid
 	ch <- c.scrapeSuccess
+	ch <- c.namespaceScrapeSuccess
 }
 
 func (c *CertificateCollector) Collect(ch chan<- prometheus.Metric) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	secrets, err := c.client.
-		CoreV1().
-		Secrets("").
-		List(ctx, metav1.ListOptions{})
-
-	if err != nil {
-		log.Printf("failed to list Kubernetes Secrets: %v", err)
-
-		ch <- prometheus.MustNewConstMetric(
-			c.scrapeSuccess,
-			prometheus.GaugeValue,
-			0,
-		)
-
-		return
-	}
-
 	total := 0
 	now := time.Now()
+	scrapeOK := true
 
-	for _, secret := range secrets.Items {
-		if secret.Type != corev1.SecretTypeTLS {
-			continue
-		}
+	for _, namespace := range c.namespaces {
+		secrets, err := c.client.
+			CoreV1().
+			Secrets(namespace).
+			List(ctx, metav1.ListOptions{})
 
-		total++
-
-		certificateData, ok := secret.Data[corev1.TLSCertKey]
-		if !ok {
-			log.Printf(
-				"Secret %s/%s does not contain %s",
-				secret.Namespace,
-				secret.Name,
-				corev1.TLSCertKey,
-			)
-
-			ch <- prometheus.MustNewConstMetric(
-				c.certificateParseSuccess,
-				prometheus.GaugeValue,
-				0,
-				secret.Namespace,
-				secret.Name,
-			)
-
-			continue
-		}
-
-		if len(certificateData) == 0 {
-			log.Printf(
-				"Secret %s/%s contains an empty %s",
-				secret.Namespace,
-				secret.Name,
-				corev1.TLSCertKey,
-			)
-
-			ch <- prometheus.MustNewConstMetric(
-				c.certificateParseSuccess,
-				prometheus.GaugeValue,
-				0,
-				secret.Namespace,
-				secret.Name,
-			)
-
-			continue
-		}
-
-		cert, err := parseCertificate(certificateData)
 		if err != nil {
 			log.Printf(
-				"failed to parse certificate %s/%s: %v",
-				secret.Namespace,
-				secret.Name,
+				"failed to list Kubernetes Secrets in namespace %q: %v",
+				namespace,
 				err,
 			)
 
 			ch <- prometheus.MustNewConstMetric(
-				c.certificateParseSuccess,
+				c.namespaceScrapeSuccess,
 				prometheus.GaugeValue,
 				0,
-				secret.Namespace,
-				secret.Name,
+				namespace,
 			)
 
+			scrapeOK = false
 			continue
 		}
 
 		ch <- prometheus.MustNewConstMetric(
-			c.certificateExpiry,
-			prometheus.GaugeValue,
-			float64(cert.NotAfter.Unix()),
-			secret.Namespace,
-			secret.Name,
-		)
-
-		ch <- prometheus.MustNewConstMetric(
-			c.certificateNotBefore,
-			prometheus.GaugeValue,
-			float64(cert.NotBefore.Unix()),
-			secret.Namespace,
-			secret.Name,
-		)
-
-		ch <- prometheus.MustNewConstMetric(
-			c.certificateInfo,
+			c.namespaceScrapeSuccess,
 			prometheus.GaugeValue,
 			1,
-			secret.Namespace,
-			secret.Name,
-			cert.Subject.CommonName,
-			cert.Issuer.CommonName,
-			strconv.FormatBool(cert.IsCA),
+			namespace,
 		)
 
-		ch <- prometheus.MustNewConstMetric(
-			c.certificateParseSuccess,
-			prometheus.GaugeValue,
-			1,
-			secret.Namespace,
-			secret.Name,
-		)
+		for _, secret := range secrets.Items {
+			if secret.Type != corev1.SecretTypeTLS {
+				continue
+			}
 
-		valid := 0.0
+			total++
 
-		if !now.Before(cert.NotBefore) && now.Before(cert.NotAfter) {
-			valid = 1
+			certificateData, ok := secret.Data[corev1.TLSCertKey]
+			if !ok {
+				log.Printf(
+					"Secret %s/%s does not contain %s",
+					secret.Namespace,
+					secret.Name,
+					corev1.TLSCertKey,
+				)
+
+				ch <- prometheus.MustNewConstMetric(
+					c.certificateParseSuccess,
+					prometheus.GaugeValue,
+					0,
+					secret.Namespace,
+					secret.Name,
+				)
+
+				continue
+			}
+
+			if len(certificateData) == 0 {
+				log.Printf(
+					"Secret %s/%s contains an empty %s",
+					secret.Namespace,
+					secret.Name,
+					corev1.TLSCertKey,
+				)
+
+				ch <- prometheus.MustNewConstMetric(
+					c.certificateParseSuccess,
+					prometheus.GaugeValue,
+					0,
+					secret.Namespace,
+					secret.Name,
+				)
+
+				continue
+			}
+
+			cert, err := parseCertificate(certificateData)
+			if err != nil {
+				log.Printf(
+					"failed to parse certificate %s/%s: %v",
+					secret.Namespace,
+					secret.Name,
+					err,
+				)
+
+				ch <- prometheus.MustNewConstMetric(
+					c.certificateParseSuccess,
+					prometheus.GaugeValue,
+					0,
+					secret.Namespace,
+					secret.Name,
+				)
+
+				continue
+			}
+
+			ch <- prometheus.MustNewConstMetric(
+				c.certificateExpiry,
+				prometheus.GaugeValue,
+				float64(cert.NotAfter.Unix()),
+				secret.Namespace,
+				secret.Name,
+			)
+
+			ch <- prometheus.MustNewConstMetric(
+				c.certificateNotBefore,
+				prometheus.GaugeValue,
+				float64(cert.NotBefore.Unix()),
+				secret.Namespace,
+				secret.Name,
+			)
+
+			ch <- prometheus.MustNewConstMetric(
+				c.certificateInfo,
+				prometheus.GaugeValue,
+				1,
+				secret.Namespace,
+				secret.Name,
+				cert.Subject.CommonName,
+				cert.Issuer.CommonName,
+				strconv.FormatBool(cert.IsCA),
+			)
+
+			ch <- prometheus.MustNewConstMetric(
+				c.certificateParseSuccess,
+				prometheus.GaugeValue,
+				1,
+				secret.Namespace,
+				secret.Name,
+			)
+
+			valid := 0.0
+
+			if !now.Before(cert.NotBefore) && now.Before(cert.NotAfter) {
+				valid = 1
+			}
+
+			ch <- prometheus.MustNewConstMetric(
+				c.certificateValid,
+				prometheus.GaugeValue,
+				valid,
+				secret.Namespace,
+				secret.Name,
+			)
 		}
-
-		ch <- prometheus.MustNewConstMetric(
-			c.certificateValid,
-			prometheus.GaugeValue,
-			valid,
-			secret.Namespace,
-			secret.Name,
-		)
 	}
 
 	ch <- prometheus.MustNewConstMetric(
@@ -247,10 +276,16 @@ func (c *CertificateCollector) Collect(ch chan<- prometheus.Metric) {
 		float64(total),
 	)
 
+	success := 1.0
+
+	if !scrapeOK {
+		success = 0
+	}
+
 	ch <- prometheus.MustNewConstMetric(
 		c.scrapeSuccess,
 		prometheus.GaugeValue,
-		1,
+		success,
 	)
 }
 
