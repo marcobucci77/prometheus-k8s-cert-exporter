@@ -75,6 +75,7 @@ func NewCertificateCollector(
 				"secret",
 				"common_name",
 				"issuer",
+				"serial_number",
 				"is_ca",
 			},
 			nil,
@@ -243,6 +244,7 @@ func (c *CertificateCollector) Collect(ch chan<- prometheus.Metric) {
 				secret.Name,
 				cert.Subject.CommonName,
 				cert.Issuer.CommonName,
+				fmt.Sprintf("%X", cert.SerialNumber),
 				strconv.FormatBool(cert.IsCA),
 			)
 
